@@ -1,88 +1,117 @@
-# Deploy VMCRIB01 — Cribl Stream → Graylog (GELF HTTP)
+# VMCRIB01 — Cribl Stream → Graylog (GELF HTTP)
 
-Single-VM deployment of Cribl Stream on Ubuntu Server 24.04, running as `vmcrib01` on Proxmox, forwarding logs to Graylog (`vmgray01`) via GELF HTTP on port `12201`. Copy/paste friendly.
+> Single-VM deployment of Cribl Stream on Ubuntu Server 24.04, running on Proxmox, forwarding logs to Graylog (`vmgray01`) via GELF HTTP on port `12201`.
 
-> Guardrail: `vmcrib01` runs **Cribl Stream only**. Graylog, OpenSearch, and MongoDB stay on `vmgray01`.
-> Guardrail: **Do not** use the Cribl `https://sh.cribl.io/install.sh` script on this box — it failed to create `/opt/cribl` and `cribl.service` here. Use the manual tarball method in this runbook.
+---
 
-* * *
+## At a Glance
 
-## 0) VM definition in Proxmox (before OS install)
+| Field | Value |
+|-------|-------|
+| VM/CT Name | `VMCRIB01` |
+| Host Node | Proxmox cluster |
+| IP Address | `<vmcrib01-ip>` |
+| OS | Ubuntu Server 24.04 (minimal) |
+| vCPU / RAM / Disk | 2 (4+ recommended) / 4 GB / 20–40 GB |
+| Key Ports | `9000` (UI), `10090` (TCP test), `12201` (outbound GELF) |
+| Credentials | Bitwarden: "VMCRIB01" |
+| Depends On | Proxmox, Graylog (`vmgray01`) |
 
-Create a new VM on your Proxmox cluster:
+> **Warning:** `vmcrib01` runs **Cribl Stream only**. Graylog, OpenSearch, and MongoDB stay on `vmgray01`.
 
-- Name: `VMCRIB01`
-- Guest OS: Linux → Ubuntu → 24.04
-- CPU: 2 vCPUs (4+ recommended if you expect higher volume)
-- RAM: 4 GB (2 GB minimum, 4–8 GB recommended)
-- Disk: 20–40 GB on `local-lvm` (or your thin pool)
-- BIOS / Machine: cluster standard (e.g., `OVMF (UEFI)` or `SeaBIOS`, `q35` if preferred)
-- Network: VirtIO on `vmbr0` (flat LAN)
-- QEMU Guest Agent: Enabled (tick “Qemu Agent” checkbox)
+> **Warning:** **Do not** use the Cribl `https://sh.cribl.io/install.sh` script on this box — it failed to create `/opt/cribl` and `cribl.service` here. Use the manual tarball method in this runbook.
+
+---
+
+## Prerequisites
+
+- [ ] Proxmox node with available resources (2 vCPU, 4 GB RAM, 20–40 GB disk)
+- [ ] Network: static IP reserved or DHCP reservation configured on `vmbr0`
+- [ ] Ubuntu Server 24.04 ISO uploaded to Proxmox storage
+- [ ] Graylog (`vmgray01`) running and accessible on the LAN
+
+---
+
+## 0 — Create the VM in Proxmox
+
+Create a new VM on your Proxmox cluster with the following settings:
+
+| Setting | Value |
+|---------|-------|
+| Name | `VMCRIB01` |
+| Guest OS | Linux → Ubuntu → 24.04 |
+| CPU | 2 vCPUs (4+ recommended for higher volume) |
+| RAM | 4 GB (2 GB minimum, 4–8 GB recommended) |
+| Disk | 20–40 GB on `local-lvm` (or your thin pool) |
+| BIOS / Machine | Cluster standard (e.g., `OVMF (UEFI)` or `SeaBIOS`, `q35` if preferred) |
+| Network | VirtIO on `vmbr0` (flat LAN) |
+| QEMU Guest Agent | Enabled |
 
 Install **Ubuntu Server 24.04 (minimal)** inside this VM.
 
-* * *
+---
 
-## 1) Base OS prep & hostname (Ubuntu 24.04)
+## 1 — Base OS Setup
 
 Log in as your normal sudo user on `vmcrib01`.
 
-### 1.1 Update packages & basic tools
+### 1.1 Update packages & install base tools
 
-    sudo apt update
-    sudo apt -y full-upgrade
+```bash
+sudo apt update
+sudo apt -y full-upgrade
 
-    # Helpful base packages
-    sudo apt install -y qemu-guest-agent vim curl tar ca-certificates netcat-openbsd
+# Helpful base packages
+sudo apt install -y qemu-guest-agent vim curl tar ca-certificates netcat-openbsd
 
-    # Enable guest agent for Proxmox
-    sudo systemctl enable --now qemu-guest-agent
+# Enable guest agent for Proxmox
+sudo systemctl enable --now qemu-guest-agent
+```
 
 Reboot if the kernel was updated:
 
-    sudo reboot
+```bash
+sudo reboot
+```
 
-### 1.2 Ensure hostname and /etc/hosts are correct
+### 1.2 Set hostname and fix /etc/hosts
 
-After reboot:
+```bash
+hostnamectl set-hostname vmcrib01
 
-    hostnamectl set-hostname vmcrib01
+sudo sed -i 's/^127\.0\.1\.1.*/127.0.1.1\tvmcrib01/' /etc/hosts
+grep '^127\.0\.1\.1' /etc/hosts
+hostnamectl
+```
 
-Fix the `127.0.1.1` line in `/etc/hosts` so it matches the hostname:
+> **Note:** If you changed the hostname after install, log out and back in so your shell prompt matches.
 
-    sudo sed -i 's/^127\.0\.1\.1.*/127.0.1.1\tvmcrib01/' /etc/hosts
-    grep '^127\.0\.1\.1' /etc/hosts
-    hostnamectl
+---
 
-> If you changed the hostname after install, log out and back in so your shell prompt matches.
+## 2 — Install Cribl Stream (Manual Tarball)
 
-* * *
+> **Warning:** The official script `curl https://sh.cribl.io/install.sh | sudo bash` previously **failed** on this environment (no `/opt/cribl`, no `cribl.service`). **Always** use the tarball method below on `vmcrib01`.
 
-## 2) Install Cribl Stream under /opt/cribl (manual tarball only)
+### 2.1 Create `/opt/cribl` and set ownership
 
-> Important: The official script  
-> 
-> `curl https://sh.cribl.io/install.sh | sudo bash`  
-> 
-> previously **failed** on this environment (no `/opt/cribl`, no `cribl.service`).  
-> 
-> **Always** use the tarball method below on `vmcrib01`.
-
-### 2.1 Create `/opt/cribl` and give ownership to your user
-
-    sudo mkdir -p /opt/cribl
-    sudo chown "$USER":"$USER" /opt/cribl
-    cd /opt/cribl
+```bash
+sudo mkdir -p /opt/cribl
+sudo chown "$USER":"$USER" /opt/cribl
+cd /opt/cribl
+```
 
 ### 2.2 Download latest Cribl Stream tarball
 
-    curl -L "$(curl -s https://cdn.cribl.io/dl/latest)" -o cribl.tgz
+```bash
+curl -L "$(curl -s https://cdn.cribl.io/dl/latest)" -o cribl.tgz
+```
 
-### 2.3 Extract into `/opt/cribl` and clean up
+### 2.3 Extract and clean up
 
-    tar xzf cribl.tgz --strip-components=1
-    rm cribl.tgz
+```bash
+tar xzf cribl.tgz --strip-components=1
+rm cribl.tgz
+```
 
 You should now have:
 
@@ -91,284 +120,277 @@ You should now have:
 
 Quick sanity check:
 
-    ls -l /opt/cribl/bin
-    /opt/cribl/bin/cribl version
+```bash
+ls -l /opt/cribl/bin
+/opt/cribl/bin/cribl version
+```
 
-* * *
+---
 
-## 3) Register Cribl with systemd (boot-start)
+## 3 — Register Cribl with systemd (Boot-Start)
 
-### 3.1 Enable boot-start with systemd
+### 3.1 Enable boot-start
 
-    cd /opt/cribl
-    sudo /opt/cribl/bin/cribl boot-start enable -m systemd
+```bash
+cd /opt/cribl
+sudo /opt/cribl/bin/cribl boot-start enable -m systemd
+```
 
-This should create `/etc/systemd/system/cribl.service`.
+This creates `/etc/systemd/system/cribl.service`. Verify:
 
-Verify:
+```bash
+grep -n 'cribl' /etc/systemd/system/cribl.service
+sudo systemctl daemon-reload
+```
 
-    grep -n 'cribl' /etc/systemd/system/cribl.service
-    sudo systemctl daemon-reload
+### 3.2 Enable and start the service
 
-### 3.2 Enable and start the service (ensure persistence)
+```bash
+sudo systemctl enable cribl
+sudo systemctl start cribl
+sudo systemctl status cribl --no-pager
+```
 
-    sudo systemctl enable cribl
-    sudo systemctl start cribl
-    sudo systemctl status cribl --no-pager
-
-Expected:
+Expected output:
 
 - `Active: active (running)`
-- No errors about missing `/opt/cribl`.
+- No errors about missing `/opt/cribl`
 
-> If `cribl.service` is missing or `/opt/cribl` is not found, re-run Section 2 and 3.1.  
-> Do **not** fall back to the `sh.cribl.io` script — that’s the known-bad path on this VM.
+> **Note:** If `cribl.service` is missing or `/opt/cribl` is not found, re-run Section 2 and 3.1. Do **not** fall back to the `sh.cribl.io` script — that's the known-bad path on this VM.
 
-* * *
+---
 
-## 4) Networking & firewall on VMCRIB01
+## 4 — Networking & Firewall
 
-Cribl will use:
+Cribl uses:
 
-- Cribl UI: TCP **9000**
-- Optional TCP test source: TCP **10090** (if you enable it in Cribl)
-- Outbound to Graylog GELF HTTP: TCP **12201** to `vmgray01`
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| `9000` | TCP | Cribl Web UI |
+| `10090` | TCP | TCP test source (optional) |
+| `12201` | TCP (outbound) | GELF HTTP to `vmgray01` |
 
 If `ufw` is enabled, open ports:
 
-    sudo ufw allow 9000/tcp comment 'Cribl UI'
-    sudo ufw allow 10090/tcp comment 'Cribl TCP test input (optional)'
-    sudo ufw reload
+```bash
+sudo ufw allow 9000/tcp comment 'Cribl UI'
+sudo ufw allow 10090/tcp comment 'Cribl TCP test input (optional)'
+sudo ufw reload
+```
 
-You can verify listeners later with:
+Verify listeners:
 
-    sudo ss -ltnp | grep -E '9000|10090' || echo "No Cribl listeners yet"
+```bash
+sudo ss -ltnp | grep -E '9000|10090' || echo "No Cribl listeners yet"
+```
 
-* * *
+---
 
-## 5) Cribl Web UI – first login
+## 5 — Cribl Web UI First Login
 
-Once the `cribl` service is running:
+Once the `cribl` service is running, access the UI from your browser:
 
-From your browser (on your LAN):
+- `http://<vmcrib01-ip>:9000/`
+- Or with DNS: `http://vmcrib01.lan:9000/`
 
-- `http://<vmcrib01-ip>:9000/`  
-  or, if you have DNS:  
-- `http://vmcrib01.lan:9000/`
-
-Log in with the credentials you set during initial Cribl setup (or the defaults from Cribl docs if fresh).
+Log in with the credentials set during initial Cribl setup (or the defaults from Cribl docs if fresh).
 
 Confirm **Status → Workers** shows your local worker running.
 
-* * *
+---
 
-## 6) Graylog side — GELF HTTP input on VMGRAY01
+## 6 — Configure Graylog GELF HTTP Input (on VMGRAY01)
 
 On `vmgray01` (Graylog Web UI):
 
-1. Go to **System → Inputs**.
-2. Select **GELF HTTP** from the dropdown.
-3. Click **Launch new input**.
+1. Go to **System → Inputs**
+2. Select **GELF HTTP** from the dropdown
+3. Click **Launch new input**
 4. Configure:
    - **Title:** `gelf_http_from_cribl`
    - **Node / Global:** `Global` (or bound to the Graylog node you prefer)
    - **Bind address:** `0.0.0.0`
    - **Port:** `12201`
-5. Click **Save**.
-6. Confirm the new GELF HTTP input shows as **Running**.
+5. Click **Save**
+6. Confirm the new GELF HTTP input shows as **Running**
 
-> In this homelab, Cribl treats Graylog as a GELF HTTP endpoint on `vmgray01:12201`.
+> **Note:** In this homelab, Cribl treats Graylog as a GELF HTTP endpoint on `vmgray01:12201`.
 
-* * *
+---
 
-## 7) Cribl → Graylog wiring (destination + route)
+## 7 — Cribl → Graylog Wiring (Destination + Route)
 
-### 7.1 Create a destination called `graylog_gelf`
+### 7.1 Create destination `graylog_gelf`
 
 In Cribl UI on `vmcrib01`:
 
-#### Case A: GELF destination type exists
+**Case A: GELF destination type exists**
 
-1. Go to **Destinations**.
-2. Click **New Destination**.
-3. Select **GELF HTTP** (or Cribl’s GELF-type destination).
+1. Go to **Destinations**
+2. Click **New Destination**
+3. Select **GELF HTTP** (or Cribl's GELF-type destination)
 4. Configure:
    - **Name:** `graylog_gelf`
    - **Host:** `vmgray01`
    - **Port:** `12201`
    - **Protocol:** `HTTP`
-5. Save the destination.
+5. Save the destination
 
-#### Case B: No GELF destination type — use HTTP POST
+**Case B: No GELF destination type — use HTTP POST**
 
-1. Go to **Destinations**.
-2. Click **New Destination → HTTP**.
+1. Go to **Destinations**
+2. Click **New Destination → HTTP**
 3. Configure:
    - **Name:** `graylog_gelf`
    - **URL:** `http://vmgray01:12201/gelf`
    - **Method:** `POST`
    - **Headers:** add `Content-Type: application/json`
-4. Save the destination.
+4. Save the destination
 
-> Either way, the goal is: Cribl sends GELF-compatible JSON to Graylog on `vmgray01:12201`.
+> **Note:** Either way, the goal is: Cribl sends GELF-compatible JSON to Graylog on `vmgray01:12201`.
 
-### 7.2 Create a route `all_to_graylog`
+### 7.2 Create route `all_to_graylog`
 
-1. Go to **Routes** (for the relevant Worker Group / pipeline set).
+1. Go to **Routes** (for the relevant Worker Group / pipeline set)
 2. Create a new Route:
    - **Name:** `all_to_graylog`
    - **Condition:** `true`
    - **Pipeline:** `default`
    - **Destination(s):** `graylog_gelf`
-3. Place this route in the order you want (usually towards the bottom as a catch-all).
-4. Click **Save**.
+3. Place this route in the desired order (usually towards the bottom as a catch-all)
+4. Click **Save**
 
 ### 7.3 Commit & deploy the configuration
 
-1. Click **Commit** in the Cribl UI.
-2. Add a message, e.g. `Initial wiring to Graylog GELF HTTP`.
-3. Click **Commit**.
-4. Click **Deploy**.
-5. Select your worker / worker group (e.g. `local`), then **Deploy**.
+1. Click **Commit** in the Cribl UI
+2. Add a message, e.g. `Initial wiring to Graylog GELF HTTP`
+3. Click **Commit**
+4. Click **Deploy**
+5. Select your worker / worker group (e.g. `local`), then **Deploy**
 
-* * *
+---
 
-## 8) Optional: TCP test source on port 10090
+## 8 — Optional: TCP Test Source on Port 10090
 
 ### 8.1 Create the TCP source in Cribl
 
 In Cribl UI:
 
-1. Go to **Sources → TCP** (or **Sources → Add Source → TCP**).
+1. Go to **Sources → TCP** (or **Sources → Add Source → TCP**)
 2. Create a new source:
    - **Name:** `tcp_test_10090`
    - **Port:** `10090`
    - **Listen address:** `0.0.0.0`
    - **Transport:** `TCP`
-3. Save and ensure the source is **Enabled**.
+3. Save and ensure the source is **Enabled**
 
 This source feeds events into the pipeline where `all_to_graylog` will route them to Graylog.
 
 ### 8.2 Send a test event with `nc`
 
-On `vmcrib01`:
+```bash
+echo '{"short_message":"cribl test event","host":"vmcrib01","level":6}' | nc -q0 vmcrib01 10090
+```
 
-    echo '{"short_message":"cribl test event","host":"vmcrib01","level":6}' | nc -q0 vmcrib01 10090
+> **Note:** `netcat-openbsd` uses `-q0` to close the connection immediately after stdin is sent. The payload is a GELF-style JSON that Graylog understands on the GELF HTTP input.
 
-Notes:
+---
 
-- `netcat-openbsd` uses `-q0` to close the connection immediately after stdin is sent.
-- The payload is a GELF-style JSON that Graylog understands on the GELF HTTP input.
+## 9 — Validation
 
-* * *
-
-## 9) Validation in Graylog (end-to-end)
+### End-to-end verification in Graylog
 
 On `vmgray01` (Graylog Web UI):
 
-1. Go to **Search**.
-2. Set the time range to **Last 5 minutes** (or similar).
+1. Go to **Search**
+2. Set the time range to **Last 5 minutes**
 3. Search for:
 
-       "cribl test event" AND host:vmcrib01
+```text
+"cribl test event" AND host:vmcrib01
+```
 
-4. Confirm you see events from:
-
+4. Confirm you see events with:
    - **Source / host:** `vmcrib01`
    - **Message:** `cribl test event`
-   - Fields appropriate for your GELF layout (e.g. `_level`, `_source`).
+   - Fields appropriate for your GELF layout (e.g. `_level`, `_source`)
 
-> Once this works, you have confirmed:  
-> Cribl source → Cribl route → `graylog_gelf` destination → Graylog GELF HTTP input → Graylog search.
+> **Note:** Once this works, you have confirmed: Cribl source → Cribl route → `graylog_gelf` destination → Graylog GELF HTTP input → Graylog search.
 
-* * *
+### Service persistence checks
 
-## 10) Service persistence & health checks on VMCRIB01
+```bash
+# Confirm cribl is enabled at boot
+sudo systemctl is-enabled cribl || echo "cribl is NOT enabled"
 
-### 10.1 Confirm `cribl` is enabled at boot
+# Check current service status
+sudo systemctl status cribl --no-pager
 
-    sudo systemctl is-enabled cribl || echo "cribl is NOT enabled"
+# Verify listening ports
+sudo ss -ltnp | grep 9000 || echo "No listener on 9000 (UI)"
+sudo ss -ltnp | grep 10090 || echo "No listener on 10090 (test source, optional)"
+```
 
-Expected:
+- [ ] Web UI accessible at `http://<vmcrib01-ip>:9000`
+- [ ] `cribl.service` enabled and active
+- [ ] Test event visible in Graylog search
+- [ ] Logs are clean (`journalctl -u cribl --no-pager -n 20`)
 
-    enabled
+---
 
-If not:
+## 10 — Post-Install
 
-    sudo systemctl enable cribl
+- [ ] Change default Cribl credentials
+- [ ] Configure log forwarding to Graylog via the GELF route
+- [ ] Add `vmcrib01` to OpenVAS scan targets
+- [ ] Add `vmcrib01` to Open-AudIT discovery
 
-### 10.2 Check current service status
+---
 
-    sudo systemctl status cribl --no-pager
+## Troubleshooting
 
-If it’s not running:
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `cribl.service` missing after install | Used `sh.cribl.io` script (known-bad) | Remove leftover files, re-install via tarball (Section 2), then register with systemd (Section 3) |
+| No `/opt/cribl` directory | Scripted installer failed silently | `sudo mkdir -p /opt/cribl && sudo chown "$USER":"$USER" /opt/cribl`, then re-run tarball install |
+| Service won't start | Missing `/opt/cribl` or broken symlink | Verify tarball extracted correctly: `ls /opt/cribl/bin/cribl` |
+| Web UI not loading on :9000 | Service not running or port blocked | `sudo systemctl start cribl` and check `sudo ufw status` |
+| No events in Graylog | Route not deployed or Graylog input not running | Verify Cribl route is committed + deployed; check Graylog input is **Running** on port `12201` |
+| `nc` test event not arriving | Wrong port or netcat variant | Ensure `netcat-openbsd` is installed; use `-q0` flag |
 
-    sudo systemctl start cribl
+---
 
-### 10.3 Verify listening ports
+## Quick Reference
 
-    sudo ss -ltnp | grep 9000 || echo "No listener on 9000 (UI)"
-    sudo ss -ltnp | grep 10090 || echo "No listener on 10090 (test source, optional)"
+```bash
+# Start/stop/restart
+sudo systemctl restart cribl
 
-Expected:
+# View logs
+journalctl -u cribl -f
 
-- `0.0.0.0:9000` → Cribl UI
-- `0.0.0.0:10090` → TCP test input (if configured)
+# Check status
+sudo systemctl status cribl --no-pager
 
-* * *
+# Show Cribl version
+/opt/cribl/bin/cribl version
 
-## 11) Known installation quirk (documented behavior)
+# Check ports
+sudo ss -ltnp | grep -E '9000|10090'
 
-This section records the real-world issue that prompted the manual install method.
+# Send test event (from vmcrib01)
+echo '{"short_message":"cribl test event","host":"vmcrib01","level":6}' | nc -q0 vmcrib01 10090
+```
 
-### 11.1 Failed Cribl scripted installer
+---
 
-Running:
+## Quirks & Gotchas
 
-    curl https://sh.cribl.io/install.sh | sudo bash
+- **Scripted installer is broken on this VM:** `curl https://sh.cribl.io/install.sh | sudo bash` fails silently — no `/opt/cribl`, no `cribl.service`. Always use the manual tarball method.
+- **Two destination options for GELF:** Cribl may or may not have a native GELF destination type depending on version. Fall back to generic HTTP POST to `http://vmgray01:12201/gelf` if needed.
+- **netcat variant matters:** Use `netcat-openbsd` (provides `-q0` flag). The `netcat-traditional` package behaves differently.
+- **Hostname/hosts mismatch:** If hostname was changed post-install, the `127.0.1.1` line in `/etc/hosts` must be updated or DNS resolution issues may occur.
 
-On `vmcrib01` resulted in:
+---
 
-- No `/opt/cribl` directory created.
-- No `cribl.service` systemd unit.
-- `systemctl` could not manage Cribl, and the service was not persistent across reboots.
-
-Because of this, the supported path for this homelab node is:
-
-1. **Always** install Cribl via tarball into `/opt/cribl` (Section 2).
-2. Register Cribl with systemd using:
-
-       sudo /opt/cribl/bin/cribl boot-start enable -m systemd
-
-3. Enable + start via systemd:
-
-       sudo systemctl enable cribl
-       sudo systemctl start cribl
-
-Once this is in place, Cribl runs as a normal systemd service and persists across reboots.
-
-* * *
-
-## 12) Quick reference (commands)
-
-- Check service:
-
-      sudo systemctl status cribl --no-pager
-
-- Restart service:
-
-      sudo systemctl restart cribl
-
-- Show Cribl version:
-
-      /opt/cribl/bin/cribl version
-
-- Check ports:
-
-      sudo ss -ltnp | grep -E '9000|10090'
-
-- Send test event (from `vmcrib01`):
-
-      echo '{"short_message":"cribl test event","host":"vmcrib01","level":6}' | nc -q0 vmcrib01 10090
-
-This completes the `VMCRIB01` Cribl Stream deployment runbook in the same style as the Proxmox and VMVULN01 runbooks.
+*Last updated: 2025-07-14*
